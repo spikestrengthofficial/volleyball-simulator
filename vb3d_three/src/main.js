@@ -180,7 +180,7 @@ const params = {
   showBlockedSpikePaths: false,
 
   numberOfBlockers: 2,
-  blockPositionAlongNet: 3.4,
+  blockShadeInside: 0.35,
   blockerGap: 0.05,
   handsWidthPerBlocker: 0.6,
   handsReachAboveNet: 0.5,
@@ -191,7 +191,7 @@ const params = {
   blockTiming: "Normal",
   blockReactionSpeed: 0.7,
   blockFollowsBall: true,
-  followStrength: 0.8,
+  followStrength: 0.25,
   followDelayMs: 120,
 
   pauseSpikeSpaceWhileAdjusting: true,
@@ -201,7 +201,7 @@ const params = {
 let currentContactLabelPoint = new THREE.Vector3(-0.8, 3.8, 3.1);
 let poleVerticalCheck = new THREE.Vector3(0, 0, 1);
 let pendingHeavyRebuild = null;
-let blockerTrackY = params.blockPositionAlongNet;
+let blockerTrackY = clamp(params.hitterLateralPosition - Math.sign(params.hitterLateralPosition || 1) * params.blockShadeInside, -4.5, 4.5);
 let lastRebuildTs = Date.now();
 const uiControllers = { single: [], window: [] };
 uiControllers.auto = [];
@@ -1363,6 +1363,12 @@ function applyCameraSensitivity() {
   controls.rotateSpeed = 1.0 * s;
 }
 
+function getBlockAnchorFromHitter(hitterY) {
+  const sideSign = Math.sign(hitterY);
+  const signedSide = sideSign === 0 ? 1 : sideSign;
+  return clamp(hitterY - signedSide * params.blockShadeInside, -4.5, 4.5);
+}
+
 function getBlockerPositions(yTrack) {
   const count = Math.max(0, Math.min(3, Number(params.numberOfBlockers) || 0));
   const c = yTrack;
@@ -1792,13 +1798,13 @@ function rebuild(options = {}) {
   const tNet = estimateNetApproachTime(setPath, setTimes);
   const blockHeightMultiplier = computeBlockHeightMultiplier(tNet);
   const effectiveBlockReach = params.handsReachAboveNet * blockHeightMultiplier;
-  const yTarget = params.blockFollowsBall ? ballTrackY : params.blockPositionAlongNet;
-  if (!params.blockFollowsBall) {
-    blockerTrackY = yTarget;
-  } else {
-    const alpha = clamp((dtMs / Math.max(1, params.followDelayMs)) * params.followStrength, 0, 1);
-    blockerTrackY = blockerTrackY + (yTarget - blockerTrackY) * alpha;
-  }
+  const yAnchor = getBlockAnchorFromHitter(params.hitterLateralPosition);
+  const followBlend = params.blockFollowsBall ? clamp(params.followStrength, 0, 1) : 0;
+  const yTarget = clamp(THREE.MathUtils.lerp(yAnchor, ballTrackY, followBlend), -4.5, 4.5);
+  const alpha = params.blockFollowsBall
+    ? clamp((dtMs / Math.max(1, params.followDelayMs)) * params.followStrength, 0, 1)
+    : 1.0;
+  blockerTrackY = clamp(blockerTrackY + (yTarget - blockerTrackY) * alpha, -4.5, 4.5);
   const blockerYs = getBlockerPositions(blockerTrackY);
   addBlockerVisuals(dynamicGroup, blockerYs, netTop, effectiveBlockReach);
 
@@ -1886,7 +1892,9 @@ function rebuild(options = {}) {
     `<b>Possible spike paths (unblocked):</b> ${freeTraj.length}`,
     `<b>Possible spike paths (blocked):</b> ${blockedTraj.length}`,
     `<b>Number of blockers:</b> ${blockerYs.length}`,
-    `<b>Block tracking center:</b> ${blockerTrackY.toFixed(2)} m (lateral)`,
+    `<b>Block anchor from hitter:</b> hitter y ${params.hitterLateralPosition.toFixed(2)} m, shade inside ${params.blockShadeInside.toFixed(2)} m, y_anchor ${yAnchor.toFixed(2)} m`,
+    `<b>Block follow input:</b> y_ball ${ballTrackY.toFixed(2)} m, follow blend ${followBlend.toFixed(2)}`,
+    `<b>Block tracking center:</b> y_track ${blockerTrackY.toFixed(2)} m (lateral)`,
     `<b>Block timing:</b> ${params.blockTiming}`,
     `<b>Block reaction speed:</b> ${params.blockReactionSpeed.toFixed(2)}`,
     `<b>Block height at net:</b> ${(effectiveBlockReach).toFixed(2)} m above net (${(blockHeightMultiplier * 100).toFixed(0)}%)`,
@@ -2037,7 +2045,7 @@ function setupGui() {
 
   const blockFolder = gui.addFolder("Blockers");
   bindController(blockFolder.add(params, "numberOfBlockers", [0, 1, 2, 3]).name("Number of blockers"));
-  bindController(blockFolder.add(params, "blockPositionAlongNet", -4.5, 4.5, 0.05).name("Block position along the net"));
+  bindController(blockFolder.add(params, "blockShadeInside", 0.0, 1.0, 0.01).name("Block shade inside"));
   bindController(blockFolder.add(params, "blockerGap", 0.0, 0.3, 0.01).name("Blocker gap"));
   bindController(blockFolder.add(params, "handsWidthPerBlocker", 0.3, 1.2, 0.05).name("Hands width per blocker"));
   bindController(blockFolder.add(params, "handsReachAboveNet", 0.2, 1.2, 0.05).name("Hands reach above net"));
