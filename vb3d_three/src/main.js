@@ -156,9 +156,9 @@ const params = {
   magnusStrength: 0.0009,
 
   contactBandOffsetFromHitter: 0.2,
-  contactBandWidth: 1.2,
+  contactBandWidth: 1.4,
   contactBandHeightRange: 0.6,
-  contactBandThickness: 0.16,
+  contactBandThickness: 0.18,
   rainbowCurveAmount: 0.7,
   jumpTimingModel: true,
   timeToPeakJump: 0.25,
@@ -219,6 +219,12 @@ const autoTuneState = {
   validGreenCandidates: 0,
   failReasons: {},
   targetPoint: null,
+};
+const domeVisualDebug = {
+  topZ: 0,
+  maxVertexZ: 0,
+  minVertexZ: 0,
+  anchorOk: true,
 };
 let activeBandPivot = null;
 let activeBandWindow = null;
@@ -582,15 +588,15 @@ function getDomeParams(window) {
   const alphaMax = THREE.MathUtils.degToRad(55);
   const betaMin = THREE.MathUtils.degToRad(15);
   const betaMax = THREE.MathUtils.degToRad(89.5);
-  const dUp = clamp(window.heightRange, 0.55, 0.65);
-  const dSide = clamp(window.width, 1.1, 1.4);
-  const dForward = clamp(0.25 + 0.1 * clamp(window.curveAmount, 0, 1), 0.25, 0.35);
+  const dUp = Math.max(0.2, window?.heightRange ?? 0.6);
+  const dSide = 1.40;
+  const dForward = 0.25;
   const eps = clamp(window.thickness / Math.max(1e-6, Math.min(dForward, dSide, dUp)), 0.09, 0.35);
   return { alphaMax, betaMin, betaMax, dUp, dSide, dForward, eps };
 }
 
 function getZoneThresholds() {
-  return { greenStart: 0.65, yellowStart: 0.25 };
+  return { greenStart: 0.7, yellowStart: 0.35 };
 }
 
 function colorForQuality(q) {
@@ -610,7 +616,7 @@ function colorForQuality(q) {
 }
 
 function getBandFrameAtTime(window, t, nominalContactTime) {
-  const zTop = params.standingReachHeight + getJumpHeightAtTime(t, nominalContactTime);
+  const zTop = params.standingReachHeight + params.jumpHeight;
   const position = new THREE.Vector3(window.hitterX, window.hitterY, zTop - window.heightRange);
   const quat = new THREE.Quaternion();
   return { position, rotationY: 0, quat, zTop };
@@ -635,11 +641,8 @@ function evaluateDomePoint(local, window) {
   const E = (fp / p.dForward) ** 2 + (l / p.dSide) ** 2 + (u / p.dUp) ** 2;
   if (Math.abs(E - 1) > p.eps) return { inside: false, q: 0, hNorm: 0, E };
 
-  const alpha = Math.atan2(l, Math.max(1e-6, fp));
   const zNorm = clamp(u / p.dUp, 0, 1);
-  const fNorm = clamp(fp / p.dForward, 0, 1);
-  const aNorm = clamp(Math.abs(alpha) / p.alphaMax, 0, 1);
-  const q = 0.65 * zNorm + 0.30 * (1 - aNorm) + 0.05 * fNorm;
+  const q = zNorm;
   return { inside: true, q, hNorm: zNorm, E };
 }
 
@@ -712,6 +715,40 @@ function betterCandidate(a, b) {
   if (b.score !== a.score) return b.score > a.score ? b : a;
   if (b.peakQ !== a.peakQ) return b.peakQ > a.peakQ ? b : a;
   return b.bestLateralError < a.bestLateralError ? b : a;
+}
+
+function autoTuneGreenTargetForAuto(context) {
+  const greenPoints = generateGreenContactCandidates(context.window, context.nominalTime, 31, 12)
+    .filter((p) => p.z >= context.netTopHeight && Math.abs(p.y - context.hitterY) <= 0.8);
+  if (!greenPoints.length) return { ok: false, reason: "No green targets above net near hitter lane." };
+
+  const tCenter = clamp(context.nominalTime, 0.25, 0.9);
+  const tCandidates = linspace(Math.max(0.22, tCenter - 0.2), Math.min(0.95, tCenter + 0.2), 7);
+
+  let best = null;
+  for (let gi = 0; gi < greenPoints.length; gi++) {
+    const pg = greenPoints[gi];
+    for (let ti = 0; ti < tCandidates.length; ti++) {
+      const t = tCandidates[ti];
+      const gravityTerm = G.clone().multiplyScalar(0.5 * t * t);
+      const v0 = pg.clone().sub(context.setterPoint).sub(gravityTerm).multiplyScalar(1 / t);
+      const speed = v0.length();
+      const horiz = Math.hypot(v0.x, v0.y);
+      const elev = THREE.MathUtils.radToDeg(Math.atan2(v0.z, Math.max(1e-9, horiz)));
+      if (speed < 5 || speed > 16 || elev < 20 || elev > 75) continue;
+
+      const sampled = sampleSetPath(context.setterPoint, v0, context.tEnd, context.dt);
+      const stats = analyzeTrajectoryAgainstWindow(sampled.points, sampled.times, context.window, t, context.hitterY);
+      if (!stats.intersectsGreen) continue;
+      const objective = stats.greenTime + 0.35 * stats.yellowTime - 0.4 * stats.bestLateralError;
+      if (!best || objective > best.objective) {
+        best = { pg: pg.clone(), t, v0: v0.clone(), objective, stats, points: sampled.points, times: sampled.times };
+      }
+    }
+  }
+
+  if (!best) return { ok: false, reason: "No feasible green-intersecting trajectory under current constraints." };
+  return { ok: true, ...best };
 }
 
 function summarizeFailReasons(reasons) {
@@ -1176,16 +1213,28 @@ function addHittingWindowVisual(group, window, sampleTime, nominalContactTime) {
   if (!window) return;
   const frame = getBandFrameAtTime(window, sampleTime, nominalContactTime);
   const p = getDomeParams(window);
+  const thresholds = getZoneThresholds();
   const segA = 60;
   const segB = 24;
   const positions = [];
   const colors = [];
   const indices = [];
+  let minVertexZ = Number.POSITIVE_INFINITY;
+  let maxVertexZ = Number.NEGATIVE_INFINITY;
 
-  const pushVertex = (x, y, z, q) => {
-    const c = colorForQuality(q);
-    positions.push(x, y, z);
+  const colorForHeightNorm = (zNorm) => {
+    if (zNorm >= thresholds.greenStart) return new THREE.Color("#2ecc71");
+    if (zNorm >= thresholds.yellowStart) return new THREE.Color("#f1c40f");
+    return new THREE.Color("#e74c3c");
+  };
+
+  const pushVertex = (localPoint, zNorm) => {
+    const c = colorForHeightNorm(zNorm);
+    positions.push(localPoint.x, localPoint.y, localPoint.z);
     colors.push(c.r, c.g, c.b);
+    const worldPoint = bandLocalToWorld(localPoint, frame);
+    minVertexZ = Math.min(minVertexZ, worldPoint.z);
+    maxVertexZ = Math.max(maxVertexZ, worldPoint.z);
     return positions.length / 3 - 1;
   };
 
@@ -1194,7 +1243,7 @@ function addHittingWindowVisual(group, window, sampleTime, nominalContactTime) {
     for (let ix = 0; ix <= nx; ix++) {
       for (let iy = 0; iy <= ny; iy++) {
         const p = pointFn(ix / nx, iy / ny);
-        grid[ix][iy] = pushVertex(p.x, p.y, p.z, p.q);
+        grid[ix][iy] = pushVertex(p.local, p.zNorm);
       }
     }
     for (let ix = 0; ix < nx; ix++) {
@@ -1221,8 +1270,8 @@ function addHittingWindowVisual(group, window, sampleTime, nominalContactTime) {
     const l = p.dSide * Math.cos(beta) * Math.sin(alpha);
     const u = p.dUp * Math.sin(beta);
     const local = new THREE.Vector3(window.forwardOffset + fp + shellOffset, l, u);
-    const dome = evaluateDomePoint(local, window);
-    return { x: local.x, y: local.y, z: local.z, q: dome.q };
+    const zNorm = clamp(local.z / Math.max(1e-6, p.dUp), 0, 1);
+    return { local, zNorm };
   };
 
   addGridSurface(segA, segB, (ua, ub) => surfacePoint(ua, ub, window.thickness * 0.5));
@@ -1242,7 +1291,7 @@ function addHittingWindowVisual(group, window, sampleTime, nominalContactTime) {
     side: THREE.DoubleSide,
   });
   const band = new THREE.Mesh(bandGeometry, bandMaterial);
-  band.renderOrder = 11;
+  band.renderOrder = 40;
   const pivot = new THREE.Group();
   pivot.position.copy(frame.position);
   pivot.quaternion.copy(frame.quat);
@@ -1256,7 +1305,21 @@ function addHittingWindowVisual(group, window, sampleTime, nominalContactTime) {
     const u = p.dUp * Math.sin(p.betaMax);
     topArc.push(new THREE.Vector3(window.forwardOffset + fp, l, u));
   }
-  pivot.add(makeLine(topArc, 0x2ecc71, 0.75));
+  const topArcLine = makeLine(topArc, 0x2ecc71, 0.75);
+  topArcLine.renderOrder = 41;
+  pivot.add(topArcLine);
+
+  domeVisualDebug.topZ = frame.zTop;
+  domeVisualDebug.maxVertexZ = Number.isFinite(maxVertexZ) ? maxVertexZ : 0;
+  domeVisualDebug.minVertexZ = Number.isFinite(minVertexZ) ? minVertexZ : 0;
+  domeVisualDebug.anchorOk = Math.abs(domeVisualDebug.maxVertexZ - domeVisualDebug.topZ) <= 0.01;
+  console.assert(
+    domeVisualDebug.anchorOk,
+    `[DomeAnchor] maxVertexZ=${domeVisualDebug.maxVertexZ.toFixed(3)} expectedTopZ=${domeVisualDebug.topZ.toFixed(3)}`
+  );
+  console.log(
+    `[DomeDebug] Dome top z=${domeVisualDebug.topZ.toFixed(3)}, max vertex z=${domeVisualDebug.maxVertexZ.toFixed(3)}, min vertex z=${domeVisualDebug.minVertexZ.toFixed(3)}`
+  );
 
   group.add(pivot);
   return { pivot };
@@ -1574,7 +1637,12 @@ function rebuild(options = {}) {
   const setterPoint = new THREE.Vector3(params.setterDistanceFromNet, params.setterLateralPosition, params.setterReleaseHeight);
   const hitterMaxPoint = getHitterHighestPoint();
   const model = getActiveContactModel(hitterMaxPoint);
+  domeVisualDebug.topZ = hitterMaxPoint.z;
+  domeVisualDebug.maxVertexZ = hitterMaxPoint.z;
+  domeVisualDebug.minVertexZ = hitterMaxPoint.z - params.contactBandHeightRange;
+  domeVisualDebug.anchorOk = true;
   const autoMode = params.trajectoryControlMode === "Auto: reach contact point at chosen time";
+  let autoWindowWarning = "";
 
   let nominalContactPoint = model.nominalContactPoint.clone();
   let nominalTime = Math.max(0.05, model.nominalTime);
@@ -1587,14 +1655,46 @@ function rebuild(options = {}) {
   let launchVelocity = new THREE.Vector3(0, 0, 0);
 
   if (autoMode) {
-    launchVelocity = solveBallPathToContact(setterPoint, nominalContactPoint, nominalTime);
-    const tEnd = Math.max(1.2, nominalTime + Math.max(0.45, model.timingTolerance + 0.2));
-    const sampled = sampleSetPath(setterPoint, launchVelocity, tEnd, 0.005);
-    setPath = sampled.points;
-    setTimes = sampled.times;
-    setVels = setTimes.map((t) => launchVelocity.clone().add(G.clone().multiplyScalar(t)));
-    markerTime = nominalTime;
-    markerPoint = samplePointAtTime(setPath, setTimes, markerTime);
+    if (params.contactModel === "Hitting window (contact region + timing window)" && model.window) {
+      const tEnd = Math.max(1.2, nominalTime + Math.max(0.45, model.timingTolerance + 0.2));
+      const tuned = autoTuneGreenTargetForAuto({
+        setterPoint,
+        window: model.window,
+        nominalTime,
+        hitterY: params.hitterLateralPosition,
+        netTopHeight: netTop,
+        tEnd,
+        dt: 0.005,
+      });
+      if (!tuned.ok) {
+        autoWindowWarning = tuned.reason;
+        setPath = [setterPoint.clone()];
+        setTimes = [0];
+        setVels = [new THREE.Vector3(0, 0, 0)];
+        markerTime = nominalTime;
+        markerPoint = setterPoint.clone();
+      } else {
+        launchVelocity = tuned.v0.clone();
+        nominalContactPoint = tuned.pg.clone();
+        nominalTime = tuned.t;
+        model.nominalTime = tuned.t;
+        model.nominalContactPoint = tuned.pg.clone();
+        setPath = tuned.points;
+        setTimes = tuned.times;
+        setVels = setTimes.map((t) => launchVelocity.clone().add(G.clone().multiplyScalar(t)));
+        markerTime = nominalTime;
+        markerPoint = samplePointAtTime(setPath, setTimes, markerTime);
+      }
+    } else {
+      launchVelocity = solveBallPathToContact(setterPoint, nominalContactPoint, nominalTime);
+      const tEnd = Math.max(1.2, nominalTime + Math.max(0.45, model.timingTolerance + 0.2));
+      const sampled = sampleSetPath(setterPoint, launchVelocity, tEnd, 0.005);
+      setPath = sampled.points;
+      setTimes = sampled.times;
+      setVels = setTimes.map((t) => launchVelocity.clone().add(G.clone().multiplyScalar(t)));
+      markerTime = nominalTime;
+      markerPoint = samplePointAtTime(setPath, setTimes, markerTime);
+    }
   } else {
     launchVelocity = velocityFromLaunchControls();
     const omega = omegaVectorFromControls();
@@ -1748,10 +1848,15 @@ function rebuild(options = {}) {
     `<b>Ball flight time:</b> ${markerTime.toFixed(2)} s`,
     `<b>Rainbow forward offset:</b> ${params.contactBandOffsetFromHitter.toFixed(2)} m`,
     `<b>Rainbow curve amount:</b> ${params.rainbowCurveAmount.toFixed(2)}`,
+    `<b>Dome top z:</b> ${domeVisualDebug.topZ.toFixed(3)} m`,
+    `<b>Dome max vertex z:</b> ${domeVisualDebug.maxVertexZ.toFixed(3)} m`,
+    `<b>Dome min vertex z:</b> ${domeVisualDebug.minVertexZ.toFixed(3)} m`,
+    `<b>Dome anchor check:</b> ${domeVisualDebug.anchorOk ? "OK" : "Warning"}`,
     `<b>Time the ball stays in each zone:</b> Green ${zoneTiming.greenTime.toFixed(3)} s | Yellow ${zoneTiming.yellowTime.toFixed(3)} s | Red ${zoneTiming.redTime.toFixed(3)} s`,
     `<b>Green contact time:</b> ${zoneTiming.greenTime.toFixed(3)} s`,
     `<b>Good contact quality %:</b> ${goodContactQualityPct.toFixed(1)}%`,
     `<b>Contact timing match:</b> ${contactTimingMatch}`,
+    ...(autoWindowWarning ? [`<b>Auto warning:</b> ${autoWindowWarning}`] : []),
     `<b>Jump timing model:</b> ${params.jumpTimingModel ? "On" : "Off"} (${params.timingAlignment})`,
     `<b>Auto tune status:</b> ${autoTuneState.status}`,
     `<b>Auto tune green points:</b> ${autoTuneState.greenPointsCount}`,
